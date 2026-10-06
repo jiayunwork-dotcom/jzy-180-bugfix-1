@@ -1,0 +1,34 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: qcinspect-db
+    environment:
+      POSTGRES_USER: qc
+      POSTGRES_PASSWORD: qc
+      POSTGRES_DB: qcinspect
+    ports:
+      - "5432:5432"
+    volumes:
+      - qcinspect-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U qc -d qcinspect"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: qcinspect-server
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgres://qc:qc@db:5432/qcinspect?sslmode=disable"
+      HTTP_ADDR: ":8080"
+    ports:
+      - "8080:8080"
+
+volumes:
+  qcinspect-db-data:
