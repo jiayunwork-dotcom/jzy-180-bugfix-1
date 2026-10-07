@@ -114,11 +114,11 @@ func (s *Store) UpdateBatch(ctx context.Context, streamID, batchID int64, in Bat
 	if in.InspectedAt.Before(minT) {
 		minT = in.InspectedAt
 	}
-	events, batches, err := loadTimeline(ctx, tx, streamID)
+	tl, err := loadTimeline(ctx, tx, streamID)
 	if err != nil {
 		return MutationResult{}, err
 	}
-	items := buildOrderedItems(events, batches)
+	items := buildOrderedItems(tl)
 	startIdx := firstIndexFromTime(items, minT)
 
 	ct, err := tx.Exec(ctx,
@@ -167,11 +167,11 @@ func (s *Store) DeleteBatch(ctx context.Context, streamID, batchID int64) (Mutat
 	if oldStream != streamID {
 		return MutationResult{}, ErrNotFound
 	}
-	events, batches, err := loadTimeline(ctx, tx, streamID)
+	tl, err := loadTimeline(ctx, tx, streamID)
 	if err != nil {
 		return MutationResult{}, err
 	}
-	items := buildOrderedItems(events, batches)
+	items := buildOrderedItems(tl)
 	startIdx := firstIndexFromTime(items, at)
 
 	if _, err := tx.Exec(ctx, `DELETE FROM batches WHERE id=$1`, batchID); err != nil {
@@ -201,11 +201,11 @@ func (s *Store) Resume(ctx context.Context, streamID int64, at time.Time) (Mutat
 	if err != nil {
 		return MutationResult{}, err
 	}
-	events, batches, err := loadTimeline(ctx, tx, streamID)
+	tl, err := loadTimeline(ctx, tx, streamID)
 	if err != nil {
 		return MutationResult{}, err
 	}
-	items := buildOrderedItems(events, batches)
+	items := buildOrderedItems(tl)
 	startIdx := firstIndexFromTime(items, at)
 
 	var eventID int64
@@ -226,8 +226,27 @@ func (s *Store) Resume(ctx context.Context, streamID int64, at time.Time) (Mutat
 	return s.mutationView(ctx, streamID, rec, 0)
 }
 
-// SetFlags updates control flags. Because the flags apply to the whole
-// timeline, the stream is replayed in full.
+// SetFlags records a point-in-time change of the control flags.
+//
+// The change only governs batches later on the timeline. Its effective point
+// is the latest batch inspection time present on the stream at commit time:
+// a flags event is inserted exactly at that boundary, so every existing batch
+// keeps the record it already had and only batches entered afterwards are
+// judged with the new flags. A batch later backfilled at a time at or before
+// the boundary is still judged with the flags in force then (batches precede
+// flag events at equal times).
+//
+// When the stream has no batches yet there is no history to protect: no event
+// is recorded, the stream's initial flags are rewritten and the change
+// applies from the timeline start ("从头算起"); any earlier flag events (left
+// over after batches were deleted) are discarded.
+//
+// Flag events are immutable: they are never moved when batches are later
+// backfilled or deleted, and recomputeSuffix writes back the flags produced
+// by replaying the full timeline. Consequently, after an edit sequence such
+// as "change flags, delete all batches of that period, backfill earlier lots,
+// change flags again", the stream's reported current flags are the last
+// flags on the replay timeline, which need not equal this call's arguments.
 func (s *Store) SetFlags(ctx context.Context, streamID int64,
 	productionStable, supervisorApproval bool) (MutationResult, error) {
 	tx, err := s.pool.Begin(ctx)
@@ -239,14 +258,78 @@ func (s *Store) SetFlags(ctx context.Context, streamID int64,
 	if err != nil {
 		return MutationResult{}, err
 	}
-	if _, err := tx.Exec(ctx,
-		`UPDATE streams SET production_stable=$2, supervisor_approval=$3 WHERE id=$1`,
-		streamID, productionStable, supervisorApproval); err != nil {
+
+	var latestAt *time.Time
+	if err := tx.QueryRow(ctx,
+		`SELECT max(inspected_at) FROM batches WHERE stream_id=$1`, streamID).
+		Scan(&latestAt); err != nil {
 		return MutationResult{}, err
 	}
-	sr.ProductionStable = productionStable
-	sr.SupervisorApproval = supervisorApproval
-	rec, err := recomputeSuffix(ctx, tx, sr, 0, true)
+	if latestAt == nil {
+		// No history: the change is the stream's baseline, from the start.
+		// Earlier flag events only had meaning relative to batches that no
+		// longer exist; drop them so the (now empty) timeline stays coherent.
+		if _, err := tx.Exec(ctx,
+			`DELETE FROM stream_events WHERE stream_id=$1 AND kind='flags'`, streamID); err != nil {
+			return MutationResult{}, err
+		}
+		if _, err := tx.Exec(ctx,
+			`UPDATE streams
+			 SET production_stable=$2, supervisor_approval=$3,
+			     initial_production_stable=$2, initial_supervisor_approval=$3
+			 WHERE id=$1`,
+			streamID, productionStable, supervisorApproval); err != nil {
+			return MutationResult{}, err
+		}
+		sr.ProductionStable = productionStable
+		sr.SupervisorApproval = supervisorApproval
+		sr.InitialProductionStable = productionStable
+		sr.InitialSupervisorApproval = supervisorApproval
+		rec, err := recomputeSuffix(ctx, tx, sr, 0, true)
+		if err != nil {
+			return MutationResult{}, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return MutationResult{}, err
+		}
+		return s.mutationView(ctx, streamID, rec, 0)
+	}
+
+	tl, err := loadTimeline(ctx, tx, streamID)
+	if err != nil {
+		return MutationResult{}, err
+	}
+	oldItems := buildOrderedItems(tl)
+
+	// The flags event is placed exactly at the boundary: the latest batch's
+	// inspection time. Batches at that instant always precede it, so the
+	// boundary lot keeps the record it already had. When flags are changed
+	// several times without newer batches the events share that instant and
+	// order by ascending id, i.e. the most recent submission is last and
+	// carries the flags in force immediately after the boundary.
+	boundary := latestAt.UTC()
+
+	// Suffix start (0-based index in the NEW timeline): the new event's
+	// position. Everything at or before the boundary that precedes it (all
+	// earlier items, batches and resume events at the boundary) is unaffected;
+	// only items after the event are folded with the new flags.
+	startIdx := 0
+	for _, it := range oldItems {
+		if it.at.After(boundary) {
+			break
+		}
+		startIdx++
+	}
+
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO stream_events
+		    (stream_id, kind, occurred_at, production_stable, supervisor_approval)
+		 VALUES ($1,'flags',$2,$3,$4)`,
+		streamID, boundary, productionStable, supervisorApproval); err != nil {
+		return MutationResult{}, err
+	}
+
+	rec, err := recomputeSuffix(ctx, tx, sr, startIdx, false)
 	if err != nil {
 		return MutationResult{}, err
 	}
@@ -259,11 +342,11 @@ func (s *Store) SetFlags(ctx context.Context, streamID int64,
 // earliestAffectedForInsert computes the suffix start as the index of the
 // first existing item at or after the new batch's time.
 func earliestAffectedForInsert(ctx context.Context, tx pgx.Tx, streamID int64, at time.Time) (int, error) {
-	events, batches, err := loadTimeline(ctx, tx, streamID)
+	tl, err := loadTimeline(ctx, tx, streamID)
 	if err != nil {
 		return 0, err
 	}
-	items := buildOrderedItems(events, batches)
+	items := buildOrderedItems(tl)
 	return firstIndexFromTime(items, at), nil
 }
 

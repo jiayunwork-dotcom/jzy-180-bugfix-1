@@ -257,6 +257,113 @@ func TestFullStreamFlowOverHTTP(t *testing.T) {
 	}
 }
 
+// TestFlagBoundaryOverHTTP reproduces the original incident over the API:
+// flag PATCH must not rewrite any existing batch; the next lot is still judged
+// on the normal plan and only switches to reduced afterwards.
+func TestFlagBoundaryOverHTTP(t *testing.T) {
+	e, st := setup(t)
+	_ = st
+	mkPlan := func(name string, n, c int) float64 {
+		code, body := doJSON(t, e, "POST", "/api/plans", map[string]any{
+			"name": name, "definition": map[string]any{"kind": "single", "n": n, "c": c},
+		})
+		if code != 201 {
+			t.Fatal(body)
+		}
+		return body["id"].(float64)
+	}
+	nID, tID, rID := mkPlan("p-n", 10, 0), mkPlan("p-t", 10, 0), mkPlan("p-r", 5, 0)
+	code, body := doJSON(t, e, "POST", "/api/streams", map[string]any{
+		"name": "flag-boundary", "normal_plan_id": nID,
+		"tightened_plan_id": tID, "reduced_plan_id": rID,
+	})
+	if code != 201 {
+		t.Fatal(body)
+	}
+	sid := itoa(int64(body["id"].(float64)))
+
+	for h := 1; h <= 12; h++ {
+		ts := "2026-03-01T" + itoa(int64(h)) + ":00:00Z"
+		if h < 10 {
+			ts = "2026-03-01T0" + itoa(int64(h)) + ":00:00Z"
+		}
+		if c, b := doJSON(t, e, "POST", "/api/streams/"+sid+"/batches", map[string]any{
+			"batch_no": "L" + itoa(int64(h)), "inspected_at": ts, "d1": 0,
+		}); c != 201 {
+			t.Fatalf("L%d: %d %v", h, c, b)
+		}
+	}
+
+	// PATCH both flags on.
+	if c, b := doJSON(t, e, "PATCH", "/api/streams/"+sid, map[string]any{
+		"production_stable": true, "supervisor_approval": true,
+	}); c != 200 {
+		t.Fatalf("patch: %d %v", c, b)
+	}
+	// GET: nothing changed.
+	code, body = doJSON(t, e, "GET", "/api/streams/"+sid, nil)
+	if code != 200 {
+		t.Fatal(body)
+	}
+	stObj := body["state"].(map[string]any)
+	if stObj["severity"] != "normal" || int(stObj["score"].(float64)) != 36 {
+		t.Fatalf("after patch state=%v/%v want normal/36", stObj["severity"], stObj["score"])
+	}
+	bs, _ := body["batches"].([]any)
+	if len(bs) != 12 {
+		t.Fatalf("batches=%d want 12", len(bs))
+	}
+	for i, item := range bs {
+		b := item.(map[string]any)
+		r := b["result"].(map[string]any)
+		if r["severity"] != "normal" || r["transition"] != "none" {
+			t.Fatalf("L%s rewritten after patch: %v/%v", b["batch_no"], r["severity"], r["transition"])
+		}
+		if int(r["switching_score"].(float64)) != 3*(i+1) {
+			t.Fatalf("L%s score=%v want %d", b["batch_no"], r["switching_score"], 3*(i+1))
+		}
+	}
+
+	// L13 still normal, carries to_reduced.
+	if c, b := doJSON(t, e, "POST", "/api/streams/"+sid+"/batches", map[string]any{
+		"batch_no": "L13", "inspected_at": "2026-03-01T13:00:00Z", "d1": 0,
+	}); c != 201 {
+		t.Fatalf("L13: %d %v", c, b)
+	} else {
+		b13 := lastBatch(t, b, "L13")
+		r := b13["result"].(map[string]any)
+		if r["severity"] != "normal" || r["transition"] != "to_reduced" {
+			t.Fatalf("L13 %v/%v want normal/to_reduced", r["severity"], r["transition"])
+		}
+	}
+	// L14 reduced.
+	if c, b := doJSON(t, e, "POST", "/api/streams/"+sid+"/batches", map[string]any{
+		"batch_no": "L14", "inspected_at": "2026-03-01T14:00:00Z", "d1": 0,
+	}); c != 201 {
+		t.Fatalf("L14: %d %v", c, b)
+	} else {
+		b14 := lastBatch(t, b, "L14")
+		r := b14["result"].(map[string]any)
+		if r["severity"] != "reduced" {
+			t.Fatalf("L14 severity=%v want reduced", r["severity"])
+		}
+	}
+}
+
+// lastBatch finds one batch record in a mutation response.
+func lastBatch(t *testing.T, body map[string]any, no string) map[string]any {
+	t.Helper()
+	bs, _ := body["batches"].([]any)
+	for _, item := range bs {
+		b := item.(map[string]any)
+		if b["batch_no"] == no {
+			return b
+		}
+	}
+	t.Fatalf("batch %s missing", no)
+	return nil
+}
+
 func itoa(i int64) string {
 	if i == 0 {
 		return "0"

@@ -109,7 +109,10 @@ func InitialState() State {
 	return State{Severity: Normal, NormalWindow: []bool{}}
 }
 
-// Flags are stream-wide control inputs constant during one replay.
+// Flags are the stream control inputs in force for one fold step. The replay
+// layer supplies the value active at each batch's timeline position: flags
+// start from the stream's initial values and change when a flag-change event
+// is folded, so a single Step call only ever sees the flags of that instant.
 type Flags struct {
 	ProductionStable   bool
 	SupervisorApproval bool

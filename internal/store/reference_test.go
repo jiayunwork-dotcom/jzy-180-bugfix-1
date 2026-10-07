@@ -28,32 +28,39 @@ func loadReference(ctx context.Context, t *testing.T, st *store.Store, streamID 
 
 	var nID, tID, rID int64
 	var stable, approval bool
+	var initStable, initApproval bool
 	var stateRaw []byte
 	err := pool.QueryRow(ctx,
 		`SELECT normal_plan_id, tightened_plan_id, reduced_plan_id,
-		        production_stable, supervisor_approval, current_state
+		        production_stable, supervisor_approval,
+		        initial_production_stable, initial_supervisor_approval,
+		        current_state
 		 FROM streams WHERE id=$1`, streamID).
-		Scan(&nID, &tID, &rID, &stable, &approval, &stateRaw)
+		Scan(&nID, &tID, &rID, &stable, &approval, &initStable, &initApproval, &stateRaw)
 	if err != nil {
 		t.Fatal(err)
 	}
-	loadPlan := func(id int64) sampling.Plan {
+	loadPlan := func(id int64) (sampling.Plan, string) {
 		var def []byte
-		if err := pool.QueryRow(ctx, `SELECT definition FROM plans WHERE id=$1`, id).Scan(&def); err != nil {
+		var name string
+		if err := pool.QueryRow(ctx, `SELECT definition, name FROM plans WHERE id=$1`, id).
+			Scan(&def, &name); err != nil {
 			t.Fatal(err)
 		}
 		var pl sampling.Plan
 		if err := json.Unmarshal(def, &pl); err != nil {
 			t.Fatal(err)
 		}
-		return pl
+		return pl, name
 	}
-	pn, pt, pr := loadPlan(nID), loadPlan(tID), loadPlan(rID)
+	pn, nn := loadPlan(nID)
+	pt, nt := loadPlan(tID)
+	pr, nr := loadPlan(rID)
 	triple := statemachine.PlanTriple{Normal: pn, Tightened: pt, Reduced: pr}
 	refs := map[statemachine.Severity]statemachine.PlanRef{
-		statemachine.Normal:    {PlanID: nID, Plan: pn},
-		statemachine.Tightened: {PlanID: tID, Plan: pt},
-		statemachine.Reduced:   {PlanID: rID, Plan: pr},
+		statemachine.Normal:    {PlanID: nID, Name: nn, Plan: pn},
+		statemachine.Tightened: {PlanID: tID, Name: nt, Plan: pt},
+		statemachine.Reduced:   {PlanID: rID, Name: nr, Plan: pr},
 	}
 
 	batchRows, err := pool.Query(ctx,
@@ -83,19 +90,23 @@ func loadReference(ctx context.Context, t *testing.T, st *store.Store, streamID 
 	batchRows.Close()
 
 	eventRows, err := pool.Query(ctx,
-		`SELECT id, occurred_at FROM stream_events
-		 WHERE stream_id=$1 AND kind='resume' ORDER BY occurred_at, id`, streamID)
+		`SELECT id, kind, occurred_at, production_stable, supervisor_approval
+		 FROM stream_events
+		 WHERE stream_id=$1 ORDER BY occurred_at, id`, streamID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	type er struct {
-		id int64
-		tm time.Time
+		id     int64
+		kind   string
+		tm     time.Time
+		stable *bool
+		appr   *bool
 	}
 	var eraws []er
 	for eventRows.Next() {
 		var e er
-		if err := eventRows.Scan(&e.id, &e.tm); err != nil {
+		if err := eventRows.Scan(&e.id, &e.kind, &e.tm, &e.stable, &e.appr); err != nil {
 			t.Fatal(err)
 		}
 		eraws = append(eraws, e)
@@ -113,17 +124,47 @@ func loadReference(ctx context.Context, t *testing.T, st *store.Store, streamID 
 		})
 	}
 	for _, e := range eraws {
-		tl.Events = append(tl.Events, replay.ResumeEvent{
-			ID:         e.id,
-			OccurredAt: e.tm.UTC().Format(time.RFC3339Nano),
-		})
+		switch e.kind {
+		case "resume":
+			tl.Events = append(tl.Events, replay.ResumeEvent{
+				ID:         e.id,
+				OccurredAt: e.tm.UTC().Format(time.RFC3339Nano),
+			})
+		case "flags":
+			if e.stable == nil || e.appr == nil {
+				t.Fatalf("flags event %d missing flag columns", e.id)
+			}
+			tl.FlagEvents = append(tl.FlagEvents, replay.FlagEvent{
+				ID:                 e.id,
+				OccurredAt:         e.tm.UTC().Format(time.RFC3339Nano),
+				ProductionStable:   *e.stable,
+				SupervisorApproval: *e.appr,
+			})
+		}
 	}
-	fl := replay.Flags{ProductionStable: stable, SupervisorApproval: approval}
+	// Replay seeds from the stream's INITIAL flags; flag events carry the
+	// changes. The stream row's current flags must equal the value of the
+	// last flag event in replay order (with same-boundary flag events ordered
+	// newest-first, that is simply the greatest (occurred_at,id) one), or the
+	// initial flags when there are no flag events.
+	fl := replay.Flags{ProductionStable: initStable, SupervisorApproval: initApproval}
 	entries, final, err := replay.FullReplay(triple, refs, fl, tl)
 	if err != nil {
 		// The reference should never error on persisted data: that itself
 		// signals a serious inconsistency (e.g. a lot stored while suspended).
 		t.Fatalf("reference full replay failed: %v", err)
+	}
+	current := fl
+	for i := len(entries) - 1; i >= 0; i-- {
+		if entries[i].Kind == "flags" {
+			current = entries[i].FlagsAfter
+			break
+		}
+	}
+	if current.ProductionStable != stable || current.SupervisorApproval != approval {
+		t.Fatalf("stream current flags (%v,%v) != timeline-derived (%v,%v); initial=(%v,%v) flagEvents=%+v",
+			stable, approval, current.ProductionStable, current.SupervisorApproval,
+			initStable, initApproval, tl.FlagEvents)
 	}
 	var storedFinal statemachine.State
 	if err := json.Unmarshal(stateRaw, &storedFinal); err != nil {
@@ -170,6 +211,10 @@ func verifyAgainstReference(ctx context.Context, t *testing.T, st *store.Store, 
 		if gotAcc != want.Accepted {
 			t.Errorf("batch %d accepted stored=%v want=%v", row.ID, gotAcc, want.Accepted)
 		}
+		gotSecond, _ := row.Result["second_sample_taken"].(bool)
+		if gotSecond != want.SecondTaken {
+			t.Errorf("batch %d second_sample_taken stored=%v want=%v", row.ID, gotSecond, want.SecondTaken)
+		}
 		gotScore, _ := row.Result["switching_score"].(float64)
 		if int(gotScore) != want.Score {
 			t.Errorf("batch %d score stored=%v want=%d", row.ID, gotScore, want.Score)
@@ -182,9 +227,34 @@ func verifyAgainstReference(ctx context.Context, t *testing.T, st *store.Store, 
 		if int(gotOrd) != want.Ordinal {
 			t.Errorf("batch %d ordinal stored=%v want=%d", row.ID, gotOrd, want.Ordinal)
 		}
-		planObj, _ := row.Result["plan"].(map[string]interface{})
-		if planObj == nil {
+		// Full plan snapshot comparison (which plan档 judged the lot matters
+		// for the "台账与系统一致" requirement).
+		planObj, ok := row.Result["plan"].(map[string]interface{})
+		if !ok {
 			t.Errorf("batch %d missing plan snapshot", row.ID)
+			continue
+		}
+		gotPlanID, _ := planObj["plan_id"].(float64)
+		if int64(gotPlanID) != want.Plan.PlanID {
+			t.Errorf("batch %d plan_id stored=%v want=%d", row.ID, gotPlanID, want.Plan.PlanID)
+		}
+		gotName, _ := planObj["name"].(string)
+		if gotName != want.Plan.Name {
+			t.Errorf("batch %d plan name stored=%q want=%q", row.ID, gotName, want.Plan.Name)
+		}
+		planDef, ok := planObj["plan"].(map[string]interface{})
+		if !ok {
+			t.Errorf("batch %d plan snapshot missing plan definition", row.ID)
+			continue
+		}
+		if gotKind, _ := planDef["kind"].(string); gotKind != string(want.Plan.Plan.Kind) {
+			t.Errorf("batch %d plan kind stored=%q want=%q", row.ID, gotKind, want.Plan.Plan.Kind)
+		}
+		if gotN, _ := planDef["n"].(float64); int(gotN) != want.Plan.Plan.N {
+			t.Errorf("batch %d plan n stored=%v want=%d", row.ID, gotN, want.Plan.Plan.N)
+		}
+		if gotC, _ := planDef["c"].(float64); int(gotC) != want.Plan.Plan.C {
+			t.Errorf("batch %d plan c stored=%v want=%d", row.ID, gotC, want.Plan.Plan.C)
 		}
 	}
 	return ref

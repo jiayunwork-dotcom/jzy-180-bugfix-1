@@ -119,7 +119,8 @@ func TestRandomHistoryEdits(t *testing.T) {
 			} else {
 				live = append(live[:i], live[i+1:]...)
 			}
-		default: // toggle flags (forces full replay)
+		default: // toggle flags: the change becomes a point-in-time flags event
+			// at the latest batch inspection hour, affecting only later lots.
 			stable := rng.Intn(2) == 0
 			approval := rng.Intn(2) == 0
 			if _, err := st.SetFlags(ctx, sid, stable, approval); err != nil {

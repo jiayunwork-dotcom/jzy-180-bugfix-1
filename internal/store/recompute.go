@@ -21,9 +21,7 @@ const checkpointEvery = 50
 // streams take different row locks and never block each other.
 func lockStream(ctx context.Context, tx pgx.Tx, id int64) (StreamRow, error) {
 	row := tx.QueryRow(ctx,
-		`SELECT id, name, normal_plan_id, tightened_plan_id, reduced_plan_id,
-		        production_stable, supervisor_approval, current_state, version, created_at
-		 FROM streams WHERE id=$1 FOR UPDATE`, id)
+		`SELECT `+streamColumns+` FROM streams WHERE id=$1 FOR UPDATE`, id)
 	sr, err := scanStream(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return StreamRow{}, ErrNotFound
@@ -80,13 +78,21 @@ func boundPlans(ctx context.Context, tx pgx.Tx, sr StreamRow) (statemachine.Plan
 }
 
 // recomputeSuffix folds a stream's timeline from the best checkpoint at or
-// before startIdx (or from InitialState when fullReplay / no checkpoint),
-// persists the folded suffix, rewrites checkpoints and updates the current
-// state. Must be called inside a transaction after lockStream.
+// before the suffix start (or from InitialState when fullReplay / no usable
+// checkpoint), persists the folded suffix, rewrites checkpoints and updates
+// the current state. Must be called inside a transaction after lockStream.
+//
+// startIdx is the 0-based index, in the NEW timeline, of the first item whose
+// record may change. No checkpoint renumbering is needed: by construction the
+// changed item sits at index startIdx, so exactly startIdx items precede it
+// in both the old and new timelines; checkpoints at 1-based positions
+// <= startIdx describe the same prefix states regardless of inserts, deletes
+// or in-place edits. Checkpoints from position startIdx+1 on lie inside the
+// suffix and are deleted and rebuilt.
 func recomputeSuffix(ctx context.Context, tx pgx.Tx, sr StreamRow,
 	startIdx int, fullReplay bool) (recomputeResult, error) {
 
-	events, batches, err := loadTimeline(ctx, tx, sr.ID)
+	tlLoaded, err := loadTimeline(ctx, tx, sr.ID)
 	if err != nil {
 		return recomputeResult{}, err
 	}
@@ -94,7 +100,7 @@ func recomputeSuffix(ctx context.Context, tx pgx.Tx, sr StreamRow,
 	if err != nil {
 		return recomputeResult{}, err
 	}
-	items := buildOrderedItems(events, batches)
+	items := buildOrderedItems(tlLoaded)
 	if startIdx < 0 || startIdx > len(items) {
 		startIdx = len(items)
 	}
@@ -102,6 +108,8 @@ func recomputeSuffix(ctx context.Context, tx pgx.Tx, sr StreamRow,
 	state := statemachine.InitialState()
 	startSeq := 0
 	if !fullReplay {
+		// Seed from the checkpoint at the immediately preceding 1-based
+		// position (< startIdx+1, i.e. <= startIdx).
 		cp, err := latestCheckpointAtOrBefore(ctx, tx, sr.ID, startIdx)
 		if err != nil {
 			return recomputeResult{}, err
@@ -112,28 +120,41 @@ func recomputeSuffix(ctx context.Context, tx pgx.Tx, sr StreamRow,
 		}
 	}
 
-	tl := replay.Timeline{Events: events}
-	byID := make(map[int64]loadedBatch, len(batches))
-	for _, b := range batches {
+	tl := replay.Timeline{Events: tlLoaded.resumes, FlagEvents: tlLoaded.flagEvents}
+	byID := make(map[int64]loadedBatch, len(tlLoaded.batches))
+	for _, b := range tlLoaded.batches {
 		tl.Batches = append(tl.Batches, b.in)
 		byID[b.row.ID] = b
 	}
 
-	entries, finalState, err := replay.FoldFrom(state, triple, refs, replay.Flags{
-		ProductionStable:   sr.ProductionStable,
-		SupervisorApproval: sr.SupervisorApproval,
-	}, tl, startSeq)
+	initialFlags := replay.Flags{
+		ProductionStable:   sr.InitialProductionStable,
+		SupervisorApproval: sr.InitialSupervisorApproval,
+	}
+	// Replay seeds with the stream's INITIAL flags; flag events on the
+	// timeline change them as the fold proceeds.
+	entries, finalState, err := replay.FoldFrom(state, triple, refs, initialFlags, tl, startSeq)
 	if err != nil {
 		if errors.Is(err, statemachine.ErrSuspended) {
 			return recomputeResult{}, ErrSuspended
 		}
 		return recomputeResult{}, err
 	}
+	// The flags in force at the end of the timeline are the last entry's
+	// FlagsAfter (events included), or the initial flags for an empty
+	// timeline. These — not the value just PATCHed — are the authoritative
+	// "current flags": a change submitted after batches were deleted can end
+	// up earlier on the timeline than an older change, and replay decides.
+	finalFlags := initialFlags
+	if len(entries) > 0 {
+		finalFlags = entries[len(entries)-1].FlagsAfter
+	}
 
-	// Old checkpoints inside the recomputed suffix are stale; drop them.
+	// Checkpoints at new positions inside the suffix are stale; drop them so
+	// the fold can rewrite the periodic positions.
 	if _, err := tx.Exec(ctx,
 		`DELETE FROM stream_checkpoints WHERE stream_id=$1 AND item_seq >= $2`,
-		sr.ID, startSeq+1); err != nil {
+		sr.ID, startIdx+1); err != nil {
 		return recomputeResult{}, err
 	}
 
@@ -164,8 +185,12 @@ func recomputeSuffix(ctx context.Context, tx pgx.Tx, sr StreamRow,
 		return recomputeResult{}, err
 	}
 	if _, err := tx.Exec(ctx,
-		`UPDATE streams SET current_state=$2, version=version+1 WHERE id=$1`,
-		sr.ID, stateRaw); err != nil {
+		`UPDATE streams
+		 SET current_state=$2,
+		     production_stable=$3, supervisor_approval=$4,
+		     version=version+1
+		 WHERE id=$1`,
+		sr.ID, stateRaw, finalFlags.ProductionStable, finalFlags.SupervisorApproval); err != nil {
 		return recomputeResult{}, err
 	}
 	return out, nil
