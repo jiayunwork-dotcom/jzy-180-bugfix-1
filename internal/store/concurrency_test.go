@@ -84,6 +84,106 @@ func TestConcurrentInsertSameStream(t *testing.T) {
 	verifyAgainstReference(ctx, t, st, sid)
 }
 
+// TestConcurrentFlagTogglesAndBatches drives one stream with concurrent batch
+// writers (in-order and backdated) interleaved with concurrent PATCH flag
+// flips. After the storm it proves:
+//   - no batch lost / duplicated;
+//   - the stored state and every record equal a single-threaded full replay
+//     of all batches, resumes and flags events (no double scoring, no
+//     boundary shifting);
+//   - every earlier batch is covered by at least one flag event after it,
+//     yet none of their records depends on flag value in a way the replay
+//     cannot reconstruct (that is exactly what verifyAgainstReference checks).
+func TestConcurrentFlagTogglesAndBatches(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	nID, tID, rID := mkTriplePlans(t, st, "flagconc")
+	sr, err := st.CreateStream(ctx, store.CreateStreamParams{
+		Name: "flag-conc-stream", NormalPlanID: nID, TightenedPlanID: tID, ReducedPlanID: rID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sid := sr.ID
+
+	const writers = 12
+	const perWriter = 50
+	const flagWriters = 4
+	const perFlagWriter = 60
+	var wg sync.WaitGroup
+	var inserted, rejected, flagOK int64
+	start := make(chan struct{})
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			<-start
+			for i := 0; i < perWriter; i++ {
+				hour := 2000 + w*1000 + i
+				if i%5 == 0 {
+					hour = 1000 + ((w*29 + i) % 400)
+				}
+				_, err := st.AddBatch(ctx, sid, store.BatchInput{
+					BatchNo:     fmt.Sprintf("W%02d-%04d", w, i),
+					InspectedAt: at(hour),
+					D1:          (w*7 + i) % 9,
+				})
+				if err == nil {
+					atomic.AddInt64(&inserted, 1)
+				} else if err == store.ErrSuspended {
+					atomic.AddInt64(&rejected, 1)
+				} else {
+					t.Errorf("unexpected insert error: %v", err)
+					return
+				}
+			}
+		}(w)
+	}
+	v := true
+	f := false
+	for w := 0; w < flagWriters; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			<-start
+			for i := 0; i < perFlagWriter; i++ {
+				// Mostly real changes, occasionally no-ops.
+				ps, pa := &v, &f
+				if (w+i)%2 == 0 {
+					ps, pa = &f, &v
+				}
+				if i%13 == 0 {
+					pa = nil // partial PATCH
+				}
+				if _, err := st.SetFlags(ctx, sid, ps, pa); err != nil {
+					t.Errorf("unexpected flags error: %v", err)
+					return
+				}
+				atomic.AddInt64(&flagOK, 1)
+			}
+		}(w)
+	}
+	close(start)
+	wg.Wait()
+
+	rows, err := st.ListBatches(ctx, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if int64(len(rows)) != inserted {
+		t.Fatalf("lost/duplicated batches: list=%d inserts=%d rejected=%d flags=%d",
+			len(rows), inserted, rejected, flagOK)
+	}
+	seen := map[string]bool{}
+	for _, r := range rows {
+		if seen[r.BatchNo] {
+			t.Fatalf("duplicate batch_no %s", r.BatchNo)
+		}
+		seen[r.BatchNo] = true
+	}
+	verifyAgainstReference(ctx, t, st, sid)
+}
+
 // TestConcurrentDifferentStreamsDoNotBlock proves streams are independent:
 // writers on one stream never wait on locks held by another stream.
 func TestConcurrentDifferentStreamsDoNotBlock(t *testing.T) {

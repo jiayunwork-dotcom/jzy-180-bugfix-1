@@ -23,16 +23,24 @@ type PlanRow struct {
 
 // StreamRow is a persisted inspection stream.
 type StreamRow struct {
-	ID                 int64           `json:"id"`
-	Name               string          `json:"name"`
-	NormalPlanID       int64           `json:"normal_plan_id"`
-	TightenedPlanID    int64           `json:"tightened_plan_id"`
-	ReducedPlanID      int64           `json:"reduced_plan_id"`
-	ProductionStable   bool            `json:"production_stable"`
-	SupervisorApproval bool            `json:"supervisor_approval"`
-	CurrentState       json.RawMessage `json:"current_state"`
-	Version            int64           `json:"version"`
-	CreatedAt          time.Time       `json:"created_at"`
+	ID              int64  `json:"id"`
+	Name            string `json:"name"`
+	NormalPlanID    int64  `json:"normal_plan_id"`
+	TightenedPlanID int64  `json:"tightened_plan_id"`
+	ReducedPlanID   int64  `json:"reduced_plan_id"`
+	// ProductionStable / SupervisorApproval are the CURRENT flags: the values
+	// right after the most recent flags event, used for every batch folded
+	// after that point.
+	ProductionStable   bool `json:"production_stable"`
+	SupervisorApproval bool `json:"supervisor_approval"`
+	// Initial flags: values in effect before the first flags event. Set at
+	// creation and only rewritten by a PATCH made while the stream has no
+	// batches (then the change applies to the timeline from its start).
+	InitialStable   bool            `json:"initial_production_stable"`
+	InitialApproval bool            `json:"initial_supervisor_approval"`
+	CurrentState    json.RawMessage `json:"current_state"`
+	Version         int64           `json:"version"`
+	CreatedAt       time.Time       `json:"created_at"`
 }
 
 // BatchRow is a persisted batch with its folded record.

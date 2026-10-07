@@ -21,8 +21,7 @@ const checkpointEvery = 50
 // streams take different row locks and never block each other.
 func lockStream(ctx context.Context, tx pgx.Tx, id int64) (StreamRow, error) {
 	row := tx.QueryRow(ctx,
-		`SELECT id, name, normal_plan_id, tightened_plan_id, reduced_plan_id,
-		        production_stable, supervisor_approval, current_state, version, created_at
+		`SELECT `+streamColumns+`
 		 FROM streams WHERE id=$1 FOR UPDATE`, id)
 	sr, err := scanStream(row)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -83,10 +82,15 @@ func boundPlans(ctx context.Context, tx pgx.Tx, sr StreamRow) (statemachine.Plan
 // before startIdx (or from InitialState when fullReplay / no checkpoint),
 // persists the folded suffix, rewrites checkpoints and updates the current
 // state. Must be called inside a transaction after lockStream.
+//
+// Checkpoints store machine state only; the control flags in effect at the
+// suffix start are re-derived independently from the flag events before that
+// position (and the stream's initial flags), so they can never be seeded from
+// stale data.
 func recomputeSuffix(ctx context.Context, tx pgx.Tx, sr StreamRow,
 	startIdx int, fullReplay bool) (recomputeResult, error) {
 
-	events, batches, err := loadTimeline(ctx, tx, sr.ID)
+	lt, err := loadTimeline(ctx, tx, sr.ID)
 	if err != nil {
 		return recomputeResult{}, err
 	}
@@ -94,7 +98,7 @@ func recomputeSuffix(ctx context.Context, tx pgx.Tx, sr StreamRow,
 	if err != nil {
 		return recomputeResult{}, err
 	}
-	items := buildOrderedItems(events, batches)
+	items := buildOrderedItems(lt)
 	if startIdx < 0 || startIdx > len(items) {
 		startIdx = len(items)
 	}
@@ -111,18 +115,29 @@ func recomputeSuffix(ctx context.Context, tx pgx.Tx, sr StreamRow,
 			startSeq = cp.itemSeq
 		}
 	}
-
-	tl := replay.Timeline{Events: events}
-	byID := make(map[int64]loadedBatch, len(batches))
-	for _, b := range batches {
-		tl.Batches = append(tl.Batches, b.in)
-		byID[b.row.ID] = b
+	initialFlags := replay.Flags{
+		ProductionStable:   sr.InitialStable,
+		SupervisorApproval: sr.InitialApproval,
+	}
+	// Flags in effect immediately before startSeq: walk only the ordered
+	// events (cheap) instead of folding batches up to the cut.
+	startFlags := initialFlags
+	for _, it := range items[:minInt(startSeq, len(items))] {
+		if it.isFlags {
+			if f, ok := flagsValueAt(lt, it.eventID); ok {
+				startFlags = f
+			}
+		}
 	}
 
-	entries, finalState, err := replay.FoldFrom(state, triple, refs, replay.Flags{
-		ProductionStable:   sr.ProductionStable,
-		SupervisorApproval: sr.SupervisorApproval,
-	}, tl, startSeq)
+	tl := replay.Timeline{
+		Batches:      batchInputs(lt),
+		ResumeEvents: lt.resumes,
+		FlagsEvents:  lt.flags,
+		InitialFlags: initialFlags,
+	}
+
+	entries, finalState, err := replay.FoldFrom(state, triple, refs, startFlags, tl, startSeq)
 	if err != nil {
 		if errors.Is(err, statemachine.ErrSuspended) {
 			return recomputeResult{}, ErrSuspended
@@ -176,4 +191,28 @@ type recomputeResult struct {
 	State      statemachine.State
 	BatchByID  map[int64]statemachine.BatchResult
 	OrderedIDs []int64
+}
+
+func batchInputs(lt loadedTimeline) []statemachine.BatchInput {
+	out := make([]statemachine.BatchInput, 0, len(lt.batches))
+	for _, b := range lt.batches {
+		out = append(out, b.in)
+	}
+	return out
+}
+
+func flagsValueAt(lt loadedTimeline, eventID int64) (replay.Flags, bool) {
+	for _, e := range lt.flags {
+		if e.ID == eventID {
+			return e.Flags, true
+		}
+	}
+	return replay.Flags{}, false
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

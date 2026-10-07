@@ -46,10 +46,12 @@ func StepWithFlags(st State, b BatchInput, plans PlanTriple, refs map[Severity]P
 		Score:      st.Score,
 		Transition: TransNone,
 	}
-	// Reduced -> normal when the stable flag is revoked (checked before the
-	// lot is judged, so this lot is already judged under normal inspection —
-	// GB/T 2828.1 treats the withdrawal of authority as immediate; the batch
-	// itself is then inspected under normal rules).
+	// Reduced -> normal when the stable flag has been withdrawn by the time
+	// this lot is judged (the withdrawal is positioned in the timeline as a
+	// flags event, so this lot is the first one strictly after it and is
+	// judged under normal inspection — GB/T 2828.1 treats the withdrawal of
+	// authority as immediate; lots judged before the event keep their reduced
+	// records and are never re-folded because of it).
 	transitioning := false
 	if st.Severity == Reduced && !fl.ProductionStable {
 		st = enterNormal(st)

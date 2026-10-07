@@ -19,15 +19,22 @@ func (s *Store) ListBatches(ctx context.Context, streamID int64) ([]BatchView, e
 		return nil, err
 	}
 	defer rows.Close()
-	var out []BatchView
-	for rows.Next() {
-		bv, err := scanBatchView(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, bv)
+	return scanBatchViews(rows)
+}
+
+// listBatchesTx is ListBatches inside an existing transaction, so a mutation
+// never has to acquire a second pool connection after taking the stream lock
+// (which would deadlock under pool exhaustion).
+func listBatchesTx(ctx context.Context, tx pgx.Tx, streamID int64) ([]BatchView, error) {
+	rows, err := tx.Query(ctx,
+		`SELECT id, batch_no, inspected_at, d1, d2, result
+		 FROM batches WHERE stream_id=$1
+		 ORDER BY inspected_at, id`, streamID)
+	if err != nil {
+		return nil, err
 	}
-	return out, rows.Err()
+	defer rows.Close()
+	return scanBatchViews(rows)
 }
 
 // GetBatch fetches one batch.
@@ -40,6 +47,18 @@ func (s *Store) GetBatch(ctx context.Context, streamID, batchID int64) (BatchVie
 		return BatchView{}, ErrNotFound
 	}
 	return bv, err
+}
+
+func scanBatchViews(rows pgx.Rows) ([]BatchView, error) {
+	var out []BatchView
+	for rows.Next() {
+		bv, err := scanBatchView(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, bv)
+	}
+	return out, rows.Err()
 }
 
 func scanBatchView(r rowScanner) (BatchView, error) {

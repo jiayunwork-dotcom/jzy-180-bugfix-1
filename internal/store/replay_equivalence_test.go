@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/rand"
 	"testing"
 
@@ -11,23 +12,36 @@ import (
 )
 
 // TestRandomHistoryEdits performs a long sequence of backdated inserts,
-// deletes and count corrections (plus flag changes and resume events) and,
-// after every single mutation, compares the store's current state and every
-// per-batch record against a fresh full replay of all stored rows. This is
-// the required "incremental vs from-scratch replay" equivalence proof.
+// deletes, count/time corrections, flag flips and resume events and, after
+// every single mutation, compares the store's current state and every
+// per-batch record (severity, plan snapshot, decision, score, transition,
+// ordinal, second-sample marker) against a fresh full replay of all stored
+// rows. This is the required "incremental vs from-scratch replay"
+// equivalence proof under the new point-in-time flag semantics.
 func TestRandomHistoryEdits(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
-	nID, tID, rID := mkTriplePlans(t, st, "rand")
+	for _, seed := range []int64{20261001, 20261002, 20261003, 20261007} {
+		seed := seed
+		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
+			randomHistoryEdits(ctx, t, st, seed)
+		})
+	}
+}
+
+func randomHistoryEdits(ctx context.Context, t *testing.T, st *store.Store, seed int64) {
+	t.Helper()
+	suffix := fmt.Sprintf("rand%d", seed)
+	nID, tID, rID := mkTriplePlans(t, st, suffix)
 	sr, err := st.CreateStream(ctx, store.CreateStreamParams{
-		Name: "rand-stream", NormalPlanID: nID, TightenedPlanID: tID, ReducedPlanID: rID,
+		Name: "rand-stream-" + suffix, NormalPlanID: nID, TightenedPlanID: tID, ReducedPlanID: rID,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	sid := sr.ID
 
-	rng := rand.New(rand.NewSource(20261001))
+	rng := rand.New(rand.NewSource(seed))
 
 	type rec struct {
 		id   int64
@@ -37,23 +51,20 @@ func TestRandomHistoryEdits(t *testing.T) {
 	var live []rec
 	seq := 0
 	maxD := 8 // must be <= every plan's sample size
-	addBatch := func(hour, d int) (store.MutationResult, error) {
-		seq++
-		return st.AddBatch(ctx, sid, store.BatchInput{
-			BatchNo:     lotName(seq),
-			InspectedAt: at(hour),
-			D1:          d,
-			D2:          nil,
-		})
-	}
 
 	// Seed with a few in-order accepted lots.
 	for i := 0; i < 3; i++ {
-		mr, err := addBatch(100+seq, 0)
+		hour := 100 + i
+		mr, err := st.AddBatch(ctx, sid, store.BatchInput{
+			BatchNo:     lotName(int(seed) + seq),
+			InspectedAt: at(hour),
+			D1:          0,
+		})
+		seq++
 		if err != nil {
 			t.Fatal(err)
 		}
-		live = append(live, rec{id: newestID(mr), hour: 100 + seq, d1: 0})
+		live = append(live, rec{id: newestID(mr), hour: hour, d1: 0})
 	}
 	verifyAgainstReference(ctx, t, st, sid)
 
@@ -61,15 +72,15 @@ func TestRandomHistoryEdits(t *testing.T) {
 	for step := 0; step < steps; step++ {
 		kind := rng.Intn(100)
 		switch {
-		case kind < 60: // insert (often backdated)
+		case kind < 55: // insert (often backdated)
 			hour := 50 + rng.Intn(500)
 			d := rng.Intn(maxD + 1)
-			seq++
 			mr, err := st.AddBatch(ctx, sid, store.BatchInput{
-				BatchNo:     lotName(seq),
+				BatchNo:     lotName(int(seed) + seq),
 				InspectedAt: at(hour),
 				D1:          d,
 			})
+			seq++
 			if errors.Is(err, store.ErrSuspended) {
 				// Rolled back (the lot falls in a suspended period).
 			} else if err != nil {
@@ -77,12 +88,12 @@ func TestRandomHistoryEdits(t *testing.T) {
 			} else {
 				live = append(live, rec{id: newestID(mr), hour: hour, d1: d})
 			}
-		case kind < 80 && len(live) > 1: // correct a batch count (same time)
+		case kind < 75 && len(live) > 1: // correct a batch count (same time)
 			i := rng.Intn(len(live))
 			newD := rng.Intn(maxD + 1)
 			b := live[i]
 			_, err := st.UpdateBatch(ctx, sid, b.id, store.BatchInput{
-				BatchNo:     lotName(100000 + int(b.id)),
+				BatchNo:     lotName(int(seed) + 100000 + int(b.id)),
 				InspectedAt: at(b.hour),
 				D1:          newD,
 			})
@@ -93,12 +104,12 @@ func TestRandomHistoryEdits(t *testing.T) {
 			} else {
 				live[i].d1 = newD
 			}
-		case kind < 88 && len(live) > 1: // move a batch in time (back/forward)
+		case kind < 83 && len(live) > 1: // move a batch in time (back/forward)
 			i := rng.Intn(len(live))
 			b := live[i]
 			newHour := 50 + rng.Intn(500)
 			_, err := st.UpdateBatch(ctx, sid, b.id, store.BatchInput{
-				BatchNo:     lotName(200000 + int(b.id)),
+				BatchNo:     lotName(int(seed) + 200000 + int(b.id)),
 				InspectedAt: at(newHour),
 				D1:          b.d1,
 			})
@@ -109,7 +120,7 @@ func TestRandomHistoryEdits(t *testing.T) {
 			} else {
 				live[i].hour = newHour
 			}
-		case kind < 96 && len(live) > 1: // delete
+		case kind < 91 && len(live) >= 1: // delete (possibly the last batch)
 			i := rng.Intn(len(live))
 			b := live[i]
 			if _, err := st.DeleteBatch(ctx, sid, b.id); errors.Is(err, store.ErrSuspended) {
@@ -119,11 +130,28 @@ func TestRandomHistoryEdits(t *testing.T) {
 			} else {
 				live = append(live[:i], live[i+1:]...)
 			}
-		default: // toggle flags (forces full replay)
+		case kind < 95: // toggle flags (takes effect strictly after the current latest batch)
 			stable := rng.Intn(2) == 0
 			approval := rng.Intn(2) == 0
-			if _, err := st.SetFlags(ctx, sid, stable, approval); err != nil {
+			// Toggle the flags independently often enough to exercise partial
+			// PATCHes and the no-batches/from-start branch.
+			var ps, pa *bool
+			if rng.Intn(2) == 0 {
+				ps = &stable
+			}
+			if rng.Intn(2) == 0 {
+				pa = &approval
+			}
+			if ps == nil && pa == nil {
+				ps = &stable
+			}
+			if _, err := st.SetFlags(ctx, sid, ps, pa); err != nil {
 				t.Fatalf("step %d flags: %v", step, err)
+			}
+		default: // arbitrary resume event interleaved into the timeline
+			hour := 50 + rng.Intn(600)
+			if _, err := st.Resume(ctx, sid, at(hour)); err != nil && !errors.Is(err, store.ErrSuspended) {
+				t.Fatalf("step %d resume: %v", step, err)
 			}
 		}
 		// A rejected edit (a lot folding into a suspended period) is rolled

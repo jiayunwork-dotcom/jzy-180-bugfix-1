@@ -11,9 +11,11 @@
 //   - tightened  -> normal    : 5 consecutive lots accepted on tightened
 //   - normal     -> reduced   : switching score reaches 30 with the stream's
 //     "production stable" and "supervisor approval"
-//     flags both set
+//     flags both set AT THE TIME the lot is judged
 //   - reduced    -> normal    : one lot not accepted, or the stable flag
-//     is revoked
+//     is revoked (the revocation is a point-in-time event: only lots folded
+//     after it are judged under normal inspection; lots already judged under
+//     reduced inspection are never rewritten)
 //   - tightened  -> suspended : 5 lots (cumulative) not accepted during the
 //     current tightened-inspection period
 //   - suspended -(manual resume)-> tightened, counters restarted

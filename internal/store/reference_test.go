@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"testing"
 	"time"
 
@@ -27,13 +28,16 @@ func loadReference(ctx context.Context, t *testing.T, st *store.Store, streamID 
 	pool := st.Pool()
 
 	var nID, tID, rID int64
-	var stable, approval bool
+	var stable, approval, initialStable, initialApproval bool
 	var stateRaw []byte
 	err := pool.QueryRow(ctx,
 		`SELECT normal_plan_id, tightened_plan_id, reduced_plan_id,
-		        production_stable, supervisor_approval, current_state
-		 FROM streams WHERE id=$1`, streamID).
-		Scan(&nID, &tID, &rID, &stable, &approval, &stateRaw)
+			        production_stable, supervisor_approval,
+			        initial_production_stable, initial_supervisor_approval,
+			        current_state
+			 FROM streams WHERE id=$1`, streamID).
+		Scan(&nID, &tID, &rID, &stable, &approval,
+			&initialStable, &initialApproval, &stateRaw)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,26 +87,32 @@ func loadReference(ctx context.Context, t *testing.T, st *store.Store, streamID 
 	batchRows.Close()
 
 	eventRows, err := pool.Query(ctx,
-		`SELECT id, occurred_at FROM stream_events
-		 WHERE stream_id=$1 AND kind='resume' ORDER BY occurred_at, id`, streamID)
+		`SELECT id, kind, occurred_at, production_stable, supervisor_approval
+		 FROM stream_events WHERE stream_id=$1 ORDER BY occurred_at, id`, streamID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	type er struct {
-		id int64
-		tm time.Time
+		id     int64
+		kind   string
+		tm     time.Time
+		stable *bool
+		appr   *bool
 	}
 	var eraws []er
 	for eventRows.Next() {
 		var e er
-		if err := eventRows.Scan(&e.id, &e.tm); err != nil {
+		if err := eventRows.Scan(&e.id, &e.kind, &e.tm, &e.stable, &e.appr); err != nil {
 			t.Fatal(err)
 		}
 		eraws = append(eraws, e)
 	}
 	eventRows.Close()
 
-	tl := replay.Timeline{}
+	tl := replay.Timeline{InitialFlags: replay.Flags{
+		ProductionStable:   initialStable,
+		SupervisorApproval: initialApproval,
+	}}
 	for _, b := range braws {
 		tl.Batches = append(tl.Batches, statemachine.BatchInput{
 			ID:          b.id,
@@ -113,13 +123,29 @@ func loadReference(ctx context.Context, t *testing.T, st *store.Store, streamID 
 		})
 	}
 	for _, e := range eraws {
-		tl.Events = append(tl.Events, replay.ResumeEvent{
-			ID:         e.id,
-			OccurredAt: e.tm.UTC().Format(time.RFC3339Nano),
-		})
+		ts := e.tm.UTC().Format(time.RFC3339Nano)
+		switch e.kind {
+		case "resume":
+			tl.ResumeEvents = append(tl.ResumeEvents, replay.ResumeEvent{
+				ID:         e.id,
+				OccurredAt: ts,
+			})
+		case "flags":
+			if e.stable == nil || e.appr == nil {
+				t.Fatalf("flags event %d missing values", e.id)
+			}
+			tl.FlagsEvents = append(tl.FlagsEvents, replay.FlagsEvent{
+				ID:         e.id,
+				OccurredAt: ts,
+				Flags: replay.Flags{
+					ProductionStable:   *e.stable,
+					SupervisorApproval: *e.appr,
+				},
+			})
+		}
 	}
 	fl := replay.Flags{ProductionStable: stable, SupervisorApproval: approval}
-	entries, final, err := replay.FullReplay(triple, refs, fl, tl)
+	entries, final, err := replay.FullReplay(triple, refs, tl)
 	if err != nil {
 		// The reference should never error on persisted data: that itself
 		// signals a serious inconsistency (e.g. a lot stored while suspended).
@@ -185,6 +211,25 @@ func verifyAgainstReference(ctx context.Context, t *testing.T, st *store.Store, 
 		planObj, _ := row.Result["plan"].(map[string]interface{})
 		if planObj == nil {
 			t.Errorf("batch %d missing plan snapshot", row.ID)
+		} else {
+			gotPlan, _ := planObj["plan_id"].(float64)
+			if int64(gotPlan) != want.Plan.PlanID {
+				t.Errorf("batch %d plan id stored=%v want=%d", row.ID, gotPlan, want.Plan.PlanID)
+			}
+			planDef, err := json.Marshal(planObj["plan"])
+			if err != nil {
+				t.Fatal(err)
+			}
+			var gotDef sampling.Plan
+			if err := json.Unmarshal(planDef, &gotDef); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(gotDef, want.Plan.Plan) {
+				t.Errorf("batch %d plan definition stored=%+v want=%+v", row.ID, gotDef, want.Plan.Plan)
+			}
+		}
+		if gotSecond, _ := row.Result["second_sample_taken"].(bool); gotSecond != want.SecondTaken {
+			t.Errorf("batch %d second_sample_taken stored=%v want=%v", row.ID, gotSecond, want.SecondTaken)
 		}
 	}
 	return ref

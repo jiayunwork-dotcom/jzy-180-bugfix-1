@@ -2,13 +2,19 @@ package store
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 
 	"github.com/jackc/pgx/v5"
 
 	"qcinspect/internal/statemachine"
 )
+
+// streamColumns is the canonical SELECT list scanned by scanStream (keep in
+// sync with scanStream and the streams DDL).
+const streamColumns = `id, name, normal_plan_id, tightened_plan_id, reduced_plan_id,
+    production_stable, supervisor_approval,
+    initial_production_stable, initial_supervisor_approval,
+    current_state, version, created_at`
 
 // CreateStreamParams creates a stream bound to three existing plans.
 type CreateStreamParams struct {
@@ -20,22 +26,26 @@ type CreateStreamParams struct {
 	SupervisorApproval bool   `json:"supervisor_approval"`
 }
 
-// CreateStream inserts a stream starting on normal inspection.
+// CreateStream inserts a stream starting on normal inspection. Flags given
+// here are the initial flags and apply from the beginning of the timeline;
+// until the first PATCH with batches present there are no flag events.
 func (s *Store) CreateStream(ctx context.Context, p CreateStreamParams) (StreamRow, error) {
 	for _, pid := range []int64{p.NormalPlanID, p.TightenedPlanID, p.ReducedPlanID} {
 		if _, err := s.GetPlan(ctx, pid); err != nil {
 			return StreamRow{}, err
 		}
 	}
-	state, _ := json.Marshal(statemachine.InitialState())
+	state, _ := jsonMarshal(statemachine.InitialState())
 	row := s.pool.QueryRow(ctx,
 		`INSERT INTO streams
 		    (name, normal_plan_id, tightened_plan_id, reduced_plan_id,
-		     production_stable, supervisor_approval, current_state)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7)
-		 RETURNING id, name, normal_plan_id, tightened_plan_id, reduced_plan_id,
-		           production_stable, supervisor_approval, current_state, version, created_at`,
+		     production_stable, supervisor_approval,
+		     initial_production_stable, initial_supervisor_approval,
+		     current_state)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+		 RETURNING `+streamColumns,
 		p.Name, p.NormalPlanID, p.TightenedPlanID, p.ReducedPlanID,
+		p.ProductionStable, p.SupervisorApproval,
 		p.ProductionStable, p.SupervisorApproval, state)
 	sr, err := scanStream(row)
 	if err != nil {
@@ -47,9 +57,7 @@ func (s *Store) CreateStream(ctx context.Context, p CreateStreamParams) (StreamR
 // GetStream loads a stream.
 func (s *Store) GetStream(ctx context.Context, id int64) (StreamRow, error) {
 	row := s.pool.QueryRow(ctx,
-		`SELECT id, name, normal_plan_id, tightened_plan_id, reduced_plan_id,
-		        production_stable, supervisor_approval, current_state, version, created_at
-		 FROM streams WHERE id=$1`, id)
+		`SELECT `+streamColumns+` FROM streams WHERE id=$1`, id)
 	sr, err := scanStream(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return StreamRow{}, ErrNotFound
@@ -60,9 +68,7 @@ func (s *Store) GetStream(ctx context.Context, id int64) (StreamRow, error) {
 // ListStreams lists all streams.
 func (s *Store) ListStreams(ctx context.Context) ([]StreamRow, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT id, name, normal_plan_id, tightened_plan_id, reduced_plan_id,
-		        production_stable, supervisor_approval, current_state, version, created_at
-		 FROM streams ORDER BY name`)
+		`SELECT `+streamColumns+` FROM streams ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -78,48 +84,11 @@ func (s *Store) ListStreams(ctx context.Context) ([]StreamRow, error) {
 	return out, rows.Err()
 }
 
-// StreamFlagUpdate changes the control flags (full replay follows).
-type StreamFlagUpdate struct {
-	ProductionStable   *bool
-	SupervisorApproval *bool
-}
-
-// UpdateStreamFlags updates the stream flags and returns the new row.
-func (s *Store) UpdateStreamFlags(ctx context.Context, id int64, u StreamFlagUpdate) (StreamRow, error) {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return StreamRow{}, err
-	}
-	defer tx.Rollback(ctx)
-	sr, err := lockStream(ctx, tx, id)
-	if err != nil {
-		return StreamRow{}, err
-	}
-	if u.ProductionStable != nil {
-		sr.ProductionStable = *u.ProductionStable
-	}
-	if u.SupervisorApproval != nil {
-		sr.SupervisorApproval = *u.SupervisorApproval
-	}
-	row := tx.QueryRow(ctx,
-		`UPDATE streams SET production_stable=$2, supervisor_approval=$3 WHERE id=$1
-		 RETURNING id, name, normal_plan_id, tightened_plan_id, reduced_plan_id,
-		           production_stable, supervisor_approval, current_state, version, created_at`,
-		id, sr.ProductionStable, sr.SupervisorApproval)
-	sr, err = scanStream(row)
-	if err != nil {
-		return StreamRow{}, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return StreamRow{}, err
-	}
-	return sr, nil
-}
-
 func scanStream(r rowScanner) (StreamRow, error) {
 	var sr StreamRow
 	err := r.Scan(&sr.ID, &sr.Name, &sr.NormalPlanID, &sr.TightenedPlanID,
 		&sr.ReducedPlanID, &sr.ProductionStable, &sr.SupervisorApproval,
+		&sr.InitialStable, &sr.InitialApproval,
 		&sr.CurrentState, &sr.Version, &sr.CreatedAt)
 	return sr, err
 }

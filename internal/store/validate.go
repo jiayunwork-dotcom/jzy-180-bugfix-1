@@ -11,6 +11,8 @@ import (
 
 func jsonUnmarshal(raw []byte, v any) error { return json.Unmarshal(raw, v) }
 
+func jsonMarshal(v any) ([]byte, error) { return json.Marshal(v) }
+
 // validateBatchAgainstPlans checks the nonconforming counts against the sample
 // sizes of ALL three bound plans: a backdated batch may be judged under any
 // severity, so it must be representable under each plan.

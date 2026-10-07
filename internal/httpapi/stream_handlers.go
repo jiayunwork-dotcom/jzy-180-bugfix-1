@@ -119,19 +119,11 @@ func (s *Server) patchStream(c echo.Context) error {
 			Message: "at least one of production_stable/supervisor_approval must be set",
 		}
 	}
-	// Read current values to pass full replacement into the store.
-	d, err := s.st.GetStreamDetail(c.Request().Context(), id)
-	if err != nil {
-		return err
-	}
-	stable, approval := d.ProductionStable, d.SupervisorApproval
-	if req.ProductionStable != nil {
-		stable = *req.ProductionStable
-	}
-	if req.SupervisorApproval != nil {
-		approval = *req.SupervisorApproval
-	}
-	mr, err := s.st.SetFlags(c.Request().Context(), id, stable, approval)
+	// The store merges nil fields with the locked stream row; the change
+	// applies only to batches after the batch with the latest inspected_at
+	// present at commit time.
+	mr, err := s.st.SetFlags(c.Request().Context(), id,
+		req.ProductionStable, req.SupervisorApproval)
 	if err != nil {
 		return err
 	}

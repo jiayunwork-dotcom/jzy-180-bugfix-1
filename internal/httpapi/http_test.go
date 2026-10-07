@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -267,6 +268,111 @@ func itoa(i int64) string {
 		i /= 10
 	}
 	return string(b)
+}
+
+// TestFlagBoundaryOverHTTP reproduces the reported incident end to end:
+// L1..L12 all accepted with flags off, PATCH both flags on, earlier records
+// must be untouched and the current state must remain normal/36; reduced
+// inspection only starts after the next, post-boundary lot reaches the score
+// threshold.
+func TestFlagBoundaryOverHTTP(t *testing.T) {
+	e, _ := setup(t)
+	mk := func(name string, n, c int) int64 {
+		code, body := doJSON(t, e, "POST", "/api/plans", map[string]any{
+			"name": name, "definition": sampling.Plan{Kind: sampling.Single, N: n, C: c}})
+		if code != 201 {
+			t.Fatal(body)
+		}
+		return int64(body["id"].(float64))
+	}
+	nID, tID, rID := mk("bn", 10, 0), mk("bt", 10, 0), mk("br", 5, 0)
+
+	code, body := doJSON(t, e, "POST", "/api/streams", map[string]any{
+		"name": "boundary-http", "normal_plan_id": nID,
+		"tightened_plan_id": tID, "reduced_plan_id": rID,
+	})
+	if code != 201 {
+		t.Fatal(body)
+	}
+	sid := itoa(int64(body["id"].(float64)))
+
+	for i := 1; i <= 12; i++ {
+		ts := fmt.Sprintf("2026-03-01T%02d:00:00Z", i)
+		if c, b := doJSON(t, e, "POST", "/api/streams/"+sid+"/batches", map[string]any{
+			"batch_no": "L" + itoa(int64(i)), "inspected_at": ts, "d1": 0,
+		}); c != 201 {
+			t.Fatalf("L%d: %d %v", i, c, b)
+		}
+	}
+
+	// PATCH both flags on.
+	if c, b := doJSON(t, e, "PATCH", "/api/streams/"+sid, map[string]any{
+		"production_stable": true, "supervisor_approval": true,
+	}); c != 200 {
+		t.Fatalf("patch: %d %v", c, b)
+	}
+
+	code, body = doJSON(t, e, "GET", "/api/streams/"+sid, nil)
+	if code != 200 {
+		t.Fatal(body)
+	}
+	stObj, _ := body["state"].(map[string]any)
+	if stObj["severity"] != "normal" {
+		t.Fatalf("severity=%v, want normal", stObj["severity"])
+	}
+	if int(stObj["score"].(float64)) != 36 {
+		t.Fatalf("score=%v, want 36", stObj["score"])
+	}
+	batches, _ := body["batches"].([]any)
+	if len(batches) != 12 {
+		t.Fatalf("batches=%d", len(batches))
+	}
+	for _, raw := range batches {
+		b := raw.(map[string]any)
+		res, _ := b["result"].(map[string]any)
+		if res["severity"] != "normal" {
+			t.Errorf("%s severity=%v", b["batch_no"], res["severity"])
+		}
+		if res["transition"] != "none" {
+			t.Errorf("%s transition=%v", b["batch_no"], res["transition"])
+		}
+		plan, _ := res["plan"].(map[string]any)
+		if int64(plan["plan_id"].(float64)) != nID {
+			t.Errorf("%s plan=%v, want normal plan", b["batch_no"], plan["plan_id"])
+		}
+	}
+
+	// L13 @13:00: still normal judgment, then switches to reduced.
+	if c, b := doJSON(t, e, "POST", "/api/streams/"+sid+"/batches", map[string]any{
+		"batch_no": "L13", "inspected_at": "2026-03-01T13:00:00Z", "d1": 0,
+	}); c != 201 {
+		t.Fatalf("L13: %d %v", c, b)
+	} else {
+		bs, _ := b["batches"].([]any)
+		l13 := bs[len(bs)-1].(map[string]any)
+		res, _ := l13["result"].(map[string]any)
+		if res["severity"] != "normal" || res["transition"] != "to_reduced" {
+			t.Fatalf("L13 result=%v", res)
+		}
+		state, _ := b["state"].(map[string]any)
+		if state["severity"] != "reduced" {
+			t.Fatalf("state=%v", state)
+		}
+	}
+	// L14 is judged under the reduced plan (id rID).
+	if c, b := doJSON(t, e, "POST", "/api/streams/"+sid+"/batches", map[string]any{
+		"batch_no": "L14", "inspected_at": "2026-03-01T14:00:00Z", "d1": 0,
+	}); c != 201 {
+		t.Fatalf("L14: %d %v", c, b)
+	} else {
+		bs, _ := b["batches"].([]any)
+		l14 := bs[len(bs)-1].(map[string]any)
+		res, _ := l14["result"].(map[string]any)
+		plan, _ := res["plan"].(map[string]any)
+		if res["severity"] != "reduced" || int64(plan["plan_id"].(float64)) != rID {
+			t.Fatalf("L14 result=%v", res)
+		}
+	}
 }
 
 func abs(x float64) float64 {
